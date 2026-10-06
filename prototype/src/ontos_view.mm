@@ -826,6 +826,12 @@ struct Viewer {
     GpuBuffer quad_buffer;
     GpuBuffer line_buffer;
     GpuBuffer line_instance_buffer;
+    GpuBuffer minor_line_buffer;
+    GpuBuffer minor_line_instance_buffer;
+    GpuBuffer hud_line_buffer;
+    GpuBuffer hud_panel_buffer;
+    GpuBuffer hud_line_instance_buffer;
+    GpuBuffer hud_quad_instance_buffer;
     // Consecutive frames write alternating slots; the single in-flight
     // fence serializes submits, so the slot picked below is never read by
     // still-running GPU work when it is refilled.
@@ -869,6 +875,12 @@ struct Viewer {
         destroy_buffer(device, body_instance_buffers[0]);
         destroy_buffer(device, body_instance_buffers[1]);
         destroy_buffer(device, line_instance_buffer);
+        destroy_buffer(device, minor_line_buffer);
+        destroy_buffer(device, minor_line_instance_buffer);
+        destroy_buffer(device, hud_line_buffer);
+        destroy_buffer(device, hud_panel_buffer);
+        destroy_buffer(device, hud_line_instance_buffer);
+        destroy_buffer(device, hud_quad_instance_buffer);
         destroy_buffer(device, line_buffer);
         destroy_buffer(device, quad_buffer);
         if (in_flight != VK_NULL_HANDLE) vkDestroyFence(device, in_flight, nullptr);
@@ -1249,22 +1261,26 @@ float body_half_extent(f64 mass) {
     return std::clamp(log_size, 0.35f, 2.4f);
 }
 
-void fill_body_instances(const StreamFrame& frame, BodyInstance* instances) {
+void region_fill_color(u8 region, u8 level, float rgb[3]) {
     static const float region_hue[4] = {0.62f, 0.08f, 0.33f, 0.78f};
+    if (region <= 3) {
+        const float s = level == 1 ? 0.85f : 0.22f;
+        const float val = level == 1 ? 1.0f : 0.60f;
+        hsv_to_rgb(region_hue[region], s, val, rgb);
+    } else {
+        const float g = level == 1 ? 0.75f : 0.45f;
+        rgb[0] = g;
+        rgb[1] = g;
+        rgb[2] = g;
+    }
+}
+
+void fill_body_instances(const StreamFrame& frame, BodyInstance* instances) {
     for (size_t i = 0; i < frame.bodies.size(); ++i) {
         const StreamBody& body = frame.bodies[i];
         BodyInstance& inst = instances[i];
         float rgb[3];
-        if (body.region <= 3) {
-            const float s = body.level == 1 ? 0.85f : 0.22f;
-            const float val = body.level == 1 ? 1.0f : 0.60f;
-            hsv_to_rgb(region_hue[body.region], s, val, rgb);
-        } else {
-            const float g = body.level == 1 ? 0.75f : 0.45f;
-            rgb[0] = g;
-            rgb[1] = g;
-            rgb[2] = g;
-        }
+        region_fill_color(body.region, body.level, rgb);
         inst.x = static_cast<float>(body.x);
         inst.y = static_cast<float>(body.y);
         inst.half_extent = body_half_extent(body.mass);
@@ -1284,6 +1300,19 @@ ViewPush compute_view_push(const Camera2D& camera, VkExtent2D extent, float z) {
     push.sy = sy;
     push.tx = static_cast<float>(-camera.cx * sx);
     push.ty = static_cast<float>(-camera.cy * sy);
+    push.z = z;
+    return push;
+}
+
+// Screen-space transform for HUD primitives: pixel coordinates (y down,
+// origin top-left) to NDC, independent of the world camera. Vulkan NDC +y
+// points down the framebuffer, so the slope is positive.
+ViewPush compute_screen_push(VkExtent2D extent, float z) {
+    ViewPush push{};
+    push.sx = 2.0f / static_cast<float>(extent.width);
+    push.sy = 2.0f / static_cast<float>(extent.height);
+    push.tx = -1.0f;
+    push.ty = -1.0f;
     push.z = z;
     return push;
 }
@@ -1784,6 +1813,228 @@ void fill_flash_instances(const std::vector<ContactFlash>& flashes, BodyInstance
     }
 }
 
+// In-window HUD: a stroked 5x7 glyph font rendered through the existing line
+// pipeline plus panel/swatch quads through the body pipeline, both driven
+// with a screen-space push so the overlay is fixed regardless of camera.
+struct GlyphSeg {
+    float x1, y1, x2, y2;
+};
+
+constexpr std::size_t kMaxHudLineVerts = 8192;
+constexpr u32 kMaxHudQuads = 8;
+
+// Segment coordinates are in font units: x in [0,4], y in [0,6], y down.
+bool glyph_segments(char c, const GlyphSeg*& segs, int& count) {
+    static const GlyphSeg kA[] = {{0,6,2,0},{2,0,4,6},{1,3,3,3}};
+    static const GlyphSeg kB[] = {{0,0,0,6},{0,0,3,0},{3,0,4,1},{4,1,4,2},{4,2,3,3},
+                                  {3,3,0,3},{3,3,4,4},{4,4,4,5},{4,5,3,6},{3,6,0,6}};
+    static const GlyphSeg kC[] = {{4,1,3,0},{3,0,1,0},{1,0,0,1},{0,1,0,5},{0,5,1,6},
+                                  {1,6,3,6},{3,6,4,5}};
+    static const GlyphSeg kD[] = {{0,0,0,6},{0,0,2,0},{2,0,4,2},{4,2,4,4},{4,4,2,6},{2,6,0,6}};
+    static const GlyphSeg kE[] = {{4,0,0,0},{0,0,0,6},{0,6,4,6},{0,3,3,3}};
+    static const GlyphSeg kF[] = {{4,0,0,0},{0,0,0,6},{0,3,3,3}};
+    static const GlyphSeg kG[] = {{4,1,3,0},{3,0,1,0},{1,0,0,1},{0,1,0,5},{0,5,1,6},
+                                  {1,6,3,6},{3,6,4,5},{4,5,4,3},{4,3,2,3}};
+    static const GlyphSeg kH[] = {{0,0,0,6},{4,0,4,6},{0,3,4,3}};
+    static const GlyphSeg kI[] = {{1,0,3,0},{2,0,2,6},{1,6,3,6}};
+    static const GlyphSeg kJ[] = {{1,0,3,0},{3,0,3,5},{3,5,2,6},{2,6,1,6},{1,6,0,5}};
+    static const GlyphSeg kK[] = {{0,0,0,6},{4,0,0,3},{0,3,4,6}};
+    static const GlyphSeg kL[] = {{0,0,0,6},{0,6,4,6}};
+    static const GlyphSeg kM[] = {{0,6,0,0},{0,0,2,2},{2,2,4,0},{4,0,4,6}};
+    static const GlyphSeg kN[] = {{0,6,0,0},{0,0,4,6},{4,6,4,0}};
+    static const GlyphSeg kO[] = {{1,0,3,0},{3,0,4,1},{4,1,4,5},{4,5,3,6},{3,6,1,6},
+                                  {1,6,0,5},{0,5,0,1},{0,1,1,0}};
+    static const GlyphSeg kP[] = {{0,6,0,0},{0,0,3,0},{3,0,4,1},{4,1,4,2},{4,2,3,3},{3,3,0,3}};
+    static const GlyphSeg kQ[] = {{1,0,3,0},{3,0,4,1},{4,1,4,5},{4,5,3,6},{3,6,1,6},
+                                  {1,6,0,5},{0,5,0,1},{0,1,1,0},{2,4,4,6}};
+    static const GlyphSeg kR[] = {{0,6,0,0},{0,0,3,0},{3,0,4,1},{4,1,4,2},{4,2,3,3},
+                                  {3,3,0,3},{2,3,4,6}};
+    static const GlyphSeg kS[] = {{4,1,3,0},{3,0,1,0},{1,0,0,1},{0,1,0,2},{0,2,1,3},
+                                  {1,3,3,3},{3,3,4,4},{4,4,4,5},{4,5,3,6},{3,6,1,6},{1,6,0,5}};
+    static const GlyphSeg kT[] = {{0,0,4,0},{2,0,2,6}};
+    static const GlyphSeg kU[] = {{0,0,0,5},{0,5,1,6},{1,6,3,6},{3,6,4,5},{4,5,4,0}};
+    static const GlyphSeg kV[] = {{0,0,2,6},{2,6,4,0}};
+    static const GlyphSeg kW[] = {{0,0,0,6},{0,6,2,4},{2,4,4,6},{4,6,4,0}};
+    static const GlyphSeg kX[] = {{0,0,4,6},{4,0,0,6}};
+    static const GlyphSeg kY[] = {{0,0,2,2},{4,0,2,2},{2,2,2,6}};
+    static const GlyphSeg kZ[] = {{0,0,4,0},{4,0,0,6},{0,6,4,6}};
+    static const GlyphSeg k0[] = {{1,0,3,0},{3,0,4,1},{4,1,4,5},{4,5,3,6},{3,6,1,6},
+                                  {1,6,0,5},{0,5,0,1},{0,1,1,0},{1,5,4,1}};
+    static const GlyphSeg k1[] = {{1,1,2,0},{2,0,2,6},{1,6,3,6}};
+    static const GlyphSeg k2[] = {{0,1,1,0},{1,0,3,0},{3,0,4,1},{4,1,4,2},{4,2,0,6},{0,6,4,6}};
+    static const GlyphSeg k3[] = {{0,1,1,0},{1,0,3,0},{3,0,4,1},{4,1,4,5},{4,5,3,6},
+                                  {3,6,1,6},{1,6,0,5},{1,3,4,3}};
+    static const GlyphSeg k4[] = {{3,0,3,6},{0,3,4,3},{0,3,3,0}};
+    static const GlyphSeg k5[] = {{4,0,0,0},{0,0,0,3},{0,3,3,3},{3,3,4,4},{4,4,4,5},
+                                  {4,5,3,6},{3,6,1,6},{1,6,0,5}};
+    static const GlyphSeg k6[] = {{4,1,3,0},{3,0,1,0},{1,0,0,1},{0,1,0,5},{0,5,1,6},
+                                  {1,6,3,6},{3,6,4,5},{4,5,4,4},{4,4,3,3},{3,3,1,3},{1,3,0,4}};
+    static const GlyphSeg k7[] = {{0,0,4,0},{4,0,1,6}};
+    static const GlyphSeg k8[] = {{1,0,3,0},{3,0,4,1},{4,1,4,2},{4,2,3,3},{3,3,1,3},
+                                  {1,3,0,2},{0,2,0,1},{0,1,1,0},{0,4,0,5},{0,5,1,6},
+                                  {1,6,3,6},{3,6,4,5},{4,5,4,4},{4,4,3,3},{1,3,0,4}};
+    static const GlyphSeg k9[] = {{1,0,3,0},{3,0,4,1},{4,1,4,2},{4,2,3,3},{3,3,1,3},
+                                  {1,3,0,2},{0,2,0,1},{0,1,1,0},{3,3,4,4},{4,4,4,5},
+                                  {4,5,3,6},{3,6,1,6},{1,6,0,5}};
+    static const GlyphSeg kSlash[] = {{4,0,0,6}};
+    static const GlyphSeg kMinus[] = {{1,3,3,3}};
+
+    switch (c) {
+        case 'A': segs = kA; count = 3; return true;
+        case 'B': segs = kB; count = 10; return true;
+        case 'C': segs = kC; count = 7; return true;
+        case 'D': segs = kD; count = 6; return true;
+        case 'E': segs = kE; count = 4; return true;
+        case 'F': segs = kF; count = 3; return true;
+        case 'G': segs = kG; count = 9; return true;
+        case 'H': segs = kH; count = 3; return true;
+        case 'I': segs = kI; count = 3; return true;
+        case 'J': segs = kJ; count = 5; return true;
+        case 'K': segs = kK; count = 3; return true;
+        case 'L': segs = kL; count = 2; return true;
+        case 'M': segs = kM; count = 4; return true;
+        case 'N': segs = kN; count = 3; return true;
+        case 'O': segs = kO; count = 8; return true;
+        case 'P': segs = kP; count = 6; return true;
+        case 'Q': segs = kQ; count = 9; return true;
+        case 'R': segs = kR; count = 7; return true;
+        case 'S': segs = kS; count = 11; return true;
+        case 'T': segs = kT; count = 2; return true;
+        case 'U': segs = kU; count = 5; return true;
+        case 'V': segs = kV; count = 2; return true;
+        case 'W': segs = kW; count = 4; return true;
+        case 'X': segs = kX; count = 2; return true;
+        case 'Y': segs = kY; count = 3; return true;
+        case 'Z': segs = kZ; count = 3; return true;
+        case '0': segs = k0; count = 9; return true;
+        case '1': segs = k1; count = 3; return true;
+        case '2': segs = k2; count = 6; return true;
+        case '3': segs = k3; count = 8; return true;
+        case '4': segs = k4; count = 3; return true;
+        case '5': segs = k5; count = 8; return true;
+        case '6': segs = k6; count = 11; return true;
+        case '7': segs = k7; count = 2; return true;
+        case '8': segs = k8; count = 15; return true;
+        case '9': segs = k9; count = 13; return true;
+        case '/': segs = kSlash; count = 1; return true;
+        case '-': segs = kMinus; count = 1; return true;
+        case ' ': segs = nullptr; count = 0; return true;
+        default: return false;
+    }
+}
+
+// Appends line-list vertices (pixel space, y down) for `text` starting at
+// (ox, oy) with font unit `u`. Bounded by kMaxHudLineVerts total.
+void append_text(std::vector<float>& verts, const char* text, float ox, float oy, float u) {
+    float x = ox;
+    for (const char* p = text; *p != '\0'; ++p) {
+        const char c = *p >= 'a' && *p <= 'z' ? static_cast<char>(*p - 'a' + 'A') : *p;
+        const GlyphSeg* segs = nullptr;
+        int count = 0;
+        if (glyph_segments(c, segs, count)) {
+            for (int i = 0; i < count; ++i) {
+                if (verts.size() / 2 + 1 >= kMaxHudLineVerts) return;
+                verts.push_back(x + segs[i].x1 * u);
+                verts.push_back(oy + segs[i].y1 * u);
+                verts.push_back(x + segs[i].x2 * u);
+                verts.push_back(oy + segs[i].y2 * u);
+            }
+        }
+        x += 6.0f * u;
+    }
+}
+
+// Builds one frame of HUD content: a translucent backing panel (written as
+// explicit pixel-space corners, since the shared quad path is isotropic),
+// text rows, and the region-color legend swatches. `text` receives line
+// vertices; [accent_begin, accent_end) brackets the PAUSED row drawn in
+// amber; `quads` receives the swatch instances.
+void fill_hud(const StreamFrame& frame, std::size_t total_frames, uint32_t frames_per_tick,
+              bool paused, double ema_ms, int hud_scale, std::vector<float>& text,
+              uint32_t& accent_begin, uint32_t& accent_end, float* panel_verts,
+              BodyInstance* quads, uint32_t& quad_count) {
+    text.clear();
+    accent_begin = 0;
+    accent_end = 0;
+    quad_count = 0;
+
+    const float u = 2.0f * static_cast<float>(hud_scale);
+    const float char_w = 6.0f * u;
+    const float line_h = 9.0f * u;
+    const float pad = 5.0f * u;
+    const float margin = 6.0f * u;
+
+    char l1[48];
+    char l2[48];
+    char l3[48];
+    std::snprintf(l1, sizeof l1, "TICK %" PRIu64 "/%zu", frame.tick, total_frames);
+    std::snprintf(l2, sizeof l2, "FINE %" PRIu64 "  COARSE %" PRIu64, frame.fine, frame.coarse);
+    std::snprintf(l3, sizeof l3, "RATE 1/%u  %.0fMS", frames_per_tick, ema_ms);
+
+    static const char* kLegendLabels[5] = {"R0", "R1", "R2", "R3", "EXT"};
+    const u8 legend_regions[5] = {0, 1, 2, 3, 255};
+    const float swatch_r = 3.5f * u;
+    const float label_gap = 1.0f * u;
+    const float group_gap = 3.0f * u;
+    float legend_w = 0.0f;
+    for (int i = 0; i < 5; ++i) {
+        legend_w += 2.0f * swatch_r + label_gap + std::strlen(kLegendLabels[i]) * char_w;
+        if (i < 4) legend_w += group_gap;
+    }
+
+    const float text_w =
+        std::max({std::strlen(l1), std::strlen(l2), std::strlen(l3),
+                  std::strlen("DIM=COARSE"), paused ? std::strlen("PAUSED") : std::size_t(0)}) *
+        char_w;
+    const uint32_t rows = 3 + (paused ? 1 : 0) + 2;
+    const float panel_w = std::max(text_w, legend_w) + 2.0f * pad;
+    const float panel_h = static_cast<float>(rows) * line_h + 2.0f * pad;
+    // Corner order matches the shared quad_corners triangle strip.
+    panel_verts[0] = margin;
+    panel_verts[1] = margin;
+    panel_verts[2] = margin + panel_w;
+    panel_verts[3] = margin;
+    panel_verts[4] = margin;
+    panel_verts[5] = margin + panel_h;
+    panel_verts[6] = margin + panel_w;
+    panel_verts[7] = margin + panel_h;
+
+    float y = margin + pad;
+    const float x0 = margin + pad;
+    append_text(text, l1, x0, y, u);
+    y += line_h;
+    append_text(text, l2, x0, y, u);
+    y += line_h;
+    append_text(text, l3, x0, y, u);
+    y += line_h;
+    if (paused) {
+        accent_begin = static_cast<uint32_t>(text.size() / 2);
+        append_text(text, "PAUSED", x0, y, u);
+        accent_end = static_cast<uint32_t>(text.size() / 2);
+        y += line_h;
+    }
+
+    const float swatch_cy = y + 3.5f * u;
+    float x = x0;
+    for (int i = 0; i < 5; ++i) {
+        float rgb[3];
+        region_fill_color(legend_regions[i], 1, rgb);
+        BodyInstance& swatch = quads[quad_count++];
+        swatch.x = x + swatch_r;
+        swatch.y = swatch_cy;
+        swatch.half_extent = swatch_r;
+        swatch.shape = 1.0f;
+        swatch.r = rgb[0];
+        swatch.g = rgb[1];
+        swatch.b = rgb[2];
+        swatch.a = 0.95f;
+        append_text(text, kLegendLabels[i], x + 2.0f * swatch_r + label_gap, y, u);
+        x += 2.0f * swatch_r + label_gap + std::strlen(kLegendLabels[i]) * char_w + group_gap;
+    }
+    y += line_h;
+    append_text(text, "DIM=COARSE", x0, y, u);
+}
+
 void print_usage() {
     std::fprintf(stderr,
                  "usage: ontos_view <stream-file> [--validate] [--frames N] [--wav FILE]\n"
@@ -1794,8 +2045,8 @@ void print_usage() {
                  "               WAV + FNV hash; the mono spec-22 reference)\n"
                  "  interactive playback also plays the contact rings through the audio\n"
                  "  device live, stereo-panned and attenuated from the camera view\n"
-                 "  keys: SPACE pause  +/- rate  R restart  ESC quit  drag pan  wheel zoom"
-                 "  WASD pan\n");
+                 "  keys: SPACE pause  +/- rate  LEFT/RIGHT step one tick  R restart\n"
+                 "        F fit view  H toggle hud  ESC quit  drag pan  wheel zoom  WASD pan\n");
 }
 
 }  // namespace
@@ -1909,8 +2160,16 @@ int main(int argc, char** argv) {
             double mx = 0.0;
             double my = 0.0;
             glfwGetCursorPos(w, &mx, &my);
-            const double ndc_x = 2.0 * mx / s->fb_width - 1.0;
-            const double ndc_y = 1.0 - 2.0 * my / s->fb_height;
+            int win_w = 0;
+            int win_h = 0;
+            glfwGetWindowSize(w, &win_w, &win_h);
+            if (win_w <= 0 || win_h <= 0) return;
+            // Cursor position arrives in window coordinates (points); NDC
+            // spans the same normalized extent regardless of framebuffer
+            // DPI, so the anchor must be computed against the window size,
+            // not fb_width/fb_height (wrong anchor on retina displays).
+            const double ndc_x = 2.0 * mx / win_w - 1.0;
+            const double ndc_y = 1.0 - 2.0 * my / win_h;
             const double wx = cam.cx + ndc_x * s->fb_width / (2.0 * cam.zoom);
             const double wy = cam.cy + ndc_y * s->fb_height / (2.0 * cam.zoom);
             cam.zoom *= std::pow(1.15, -yoffset);
@@ -2301,8 +2560,13 @@ int main(int argc, char** argv) {
             create_host_buffer(v.physical_device, v.device, grid_lines, sizeof(grid_lines),
                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, false, v.line_buffer);
 
+            // Lines pass absolute world coordinates through the corner
+            // attribute, so the instance scale must be the identity 1.0 (a
+            // zero half_extent collapses every vertex onto in_position and
+            // silently culls the whole draw -- this is why the region grid
+            // never rendered before).
             BodyInstance line_instance{};
-            line_instance.half_extent = 0.0f;
+            line_instance.half_extent = 1.0f;
             line_instance.shape = 0.0f;
             line_instance.r = 0.45f;
             line_instance.g = 0.47f;
@@ -2310,6 +2574,72 @@ int main(int argc, char** argv) {
             line_instance.a = 0.35f;
             create_host_buffer(v.physical_device, v.device, &line_instance, sizeof(BodyInstance),
                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, false, v.line_instance_buffer);
+
+            // Faint 8-unit graph-paper grid under the major region lines,
+            // skipping the axes the major grid already draws (0, 64, 128).
+            std::vector<float> minor_grid;
+            for (uint32_t a = 8; a < 128; a += 8) {
+                if (a == 64) continue;
+                minor_grid.push_back(static_cast<float>(a));
+                minor_grid.push_back(0.0f);
+                minor_grid.push_back(static_cast<float>(a));
+                minor_grid.push_back(128.0f);
+                minor_grid.push_back(0.0f);
+                minor_grid.push_back(static_cast<float>(a));
+                minor_grid.push_back(128.0f);
+                minor_grid.push_back(static_cast<float>(a));
+            }
+            create_host_buffer(v.physical_device, v.device, minor_grid.data(),
+                               minor_grid.size() * sizeof(float),
+                               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, false, v.minor_line_buffer);
+
+            BodyInstance minor_line_instance{};
+            minor_line_instance.half_extent = 1.0f;
+            minor_line_instance.shape = 0.0f;
+            minor_line_instance.r = 0.45f;
+            minor_line_instance.g = 0.47f;
+            minor_line_instance.b = 0.52f;
+            minor_line_instance.a = 0.12f;
+            create_host_buffer(v.physical_device, v.device, &minor_line_instance,
+                               sizeof(BodyInstance), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, false,
+                               v.minor_line_instance_buffer);
+
+            create_host_buffer(v.physical_device, v.device, nullptr,
+                               static_cast<VkDeviceSize>(kMaxHudLineVerts) * 2 * sizeof(float),
+                               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true, v.hud_line_buffer);
+            create_host_buffer(v.physical_device, v.device, nullptr, 8 * sizeof(float),
+                               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true, v.hud_panel_buffer);
+            create_host_buffer(v.physical_device, v.device, nullptr,
+                               static_cast<VkDeviceSize>(kMaxHudQuads) * sizeof(BodyInstance),
+                               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true, v.hud_quad_instance_buffer);
+            // [0] HUD text (light gray), [1] HUD accent text (amber),
+            // [2] identity instance for the panel corner-quad draw. Text
+            // vertices are absolute pixel coordinates in the corner slot,
+            // so the scale must be 1.0 (see line_instance above).
+            BodyInstance hud_instances[3] = {};
+            hud_instances[0].half_extent = 1.0f;
+            hud_instances[0].shape = 0.0f;
+            hud_instances[0].r = 0.87f;
+            hud_instances[0].g = 0.89f;
+            hud_instances[0].b = 0.92f;
+            hud_instances[0].a = 0.9f;
+            hud_instances[1].half_extent = 1.0f;
+            hud_instances[1].shape = 0.0f;
+            hud_instances[1].r = 1.0f;
+            hud_instances[1].g = 0.78f;
+            hud_instances[1].b = 0.35f;
+            hud_instances[1].a = 0.95f;
+            hud_instances[2].x = 0.0f;
+            hud_instances[2].y = 0.0f;
+            hud_instances[2].half_extent = 1.0f;
+            hud_instances[2].shape = 0.0f;
+            hud_instances[2].r = 0.02f;
+            hud_instances[2].g = 0.03f;
+            hud_instances[2].b = 0.05f;
+            hud_instances[2].a = 0.55f;
+            create_host_buffer(v.physical_device, v.device, hud_instances,
+                               sizeof(hud_instances), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, false,
+                               v.hud_line_instance_buffer);
 
             for (uint32_t slot = 0; slot < 2; ++slot) {
                 create_host_buffer(v.physical_device, v.device, nullptr,
@@ -2332,10 +2662,17 @@ int main(int argc, char** argv) {
         uint32_t frames_per_tick = 8;
         uint32_t subframe = 0;
         bool paused = false;
+        bool stepped = false;
         bool space_was_down = false;
         bool r_was_down = false;
         bool plus_was_down = false;
         bool minus_was_down = false;
+        bool left_was_down = false;
+        bool right_was_down = false;
+        bool f_was_down = false;
+        bool h_was_down = false;
+        bool hud_visible = true;
+        int hud_scale = 1;
         size_t tick_index = 0;
         bool tick_changed = true;
         double last_time = glfwGetTime();
@@ -2350,6 +2687,17 @@ int main(int argc, char** argv) {
         uint32_t timed_frames = 0;
         uint32_t frame_number = 0;
         std::vector<ContactFlash> flashes;
+        std::vector<float> hud_text;
+        uint32_t hud_accent_begin = 0;
+        uint32_t hud_accent_end = 0;
+        float hud_panel_verts[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        BodyInstance hud_quads[kMaxHudQuads];
+        uint32_t hud_quad_count = 0;
+
+        if (!frames_requested) {
+            std::printf("keys: SPACE pause  LEFT/RIGHT step  +/- rate  R restart  F fit  H hud"
+                        "  ESC quit  drag pan  wheel zoom\n");
+        }
 
         while (frames_requested ? (frame_number < frame_limit)
                                 : (glfwWindowShouldClose(window) != GLFW_TRUE)) {
@@ -2358,6 +2706,17 @@ int main(int argc, char** argv) {
             ++frame_number;
 
             if (!frames_requested) {
+                int window_width = 0;
+                int window_height = 0;
+                glfwGetWindowSize(window, &window_width, &window_height);
+                // Screen coordinates (points) vs framebuffer pixels; cursor
+                // motion must be scaled by this to stay 1:1 with the world
+                // on retina displays, where the two differ by 2x.
+                const double content_scale =
+                    window_width > 0 ? static_cast<double>(state.fb_width) / window_width : 1.0;
+                hud_scale =
+                    std::clamp(static_cast<int>(std::lround(content_scale)), 1, 4);
+
                 if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
                     glfwSetWindowShouldClose(window, GLFW_TRUE);
                 }
@@ -2377,6 +2736,33 @@ int main(int argc, char** argv) {
                 }
                 r_was_down = r_down;
 
+                const bool left_down = glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS;
+                const bool right_down = glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS;
+                if ((left_down && !left_was_down) || (right_down && !right_was_down)) {
+                    paused = true;
+                    subframe = 0;
+                    const std::size_t span = stream.frames.size();
+                    tick_index =
+                        (tick_index + span + (right_down ? 1 : -1)) % span;
+                    tick_changed = true;
+                    stepped = true;
+                }
+                left_was_down = left_down;
+                right_was_down = right_down;
+
+                const bool f_down = glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS;
+                if (f_down && !f_was_down && state.fb_width > 0 && state.fb_height > 0) {
+                    state.camera.cx = 64.0;
+                    state.camera.cy = 64.0;
+                    state.camera.zoom =
+                        0.9 * std::min(state.fb_width, state.fb_height) / 128.0;
+                }
+                f_was_down = f_down;
+
+                const bool h_down = glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS;
+                if (h_down && !h_was_down) hud_visible = !hud_visible;
+                h_was_down = h_down;
+
                 const bool plus_down = glfwGetKey(window, GLFW_KEY_EQUAL) == GLFW_PRESS ||
                                        glfwGetKey(window, GLFW_KEY_KP_ADD) == GLFW_PRESS;
                 if (plus_down && !plus_was_down && frames_per_tick > 1) frames_per_tick /= 2;
@@ -2393,8 +2779,8 @@ int main(int argc, char** argv) {
                 const bool button_down =
                     glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
                 if (button_down && drag_active) {
-                    state.camera.cx -= (cx - last_cursor_x) / state.camera.zoom;
-                    state.camera.cy += (cy - last_cursor_y) / state.camera.zoom;
+                    state.camera.cx -= (cx - last_cursor_x) * content_scale / state.camera.zoom;
+                    state.camera.cy += (cy - last_cursor_y) * content_scale / state.camera.zoom;
                 }
                 drag_active = button_down;
                 last_cursor_x = cx;
@@ -2403,7 +2789,7 @@ int main(int argc, char** argv) {
                 const double now = glfwGetTime();
                 const double dt = std::max(now - last_time, 0.0);
                 last_time = now;
-                const double pan = 400.0 * dt / state.camera.zoom;
+                const double pan = 400.0 * dt * content_scale / state.camera.zoom;
                 if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) state.camera.cy += pan;
                 if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) state.camera.cy -= pan;
                 if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) state.camera.cx -= pan;
@@ -2420,7 +2806,9 @@ int main(int argc, char** argv) {
                 }
             }
 
-            if (!flashes.empty() && !paused) {
+            // Flashes advance with playback, and also after a manual tick
+            // step (otherwise stepped-while-paused rings never fade).
+            if (!flashes.empty() && (!paused || stepped)) {
                 const float ticks_per_frame =
                     frames_requested ? 1.0f : 1.0f / static_cast<float>(frames_per_tick);
                 const float decay = ticks_per_frame / kFlashTicks;
@@ -2431,6 +2819,7 @@ int main(int argc, char** argv) {
                                              }),
                               flashes.end());
             }
+            stepped = false;
 
             const StreamFrame& frame = stream.frames[tick_index];
 
@@ -2505,6 +2894,17 @@ int main(int argc, char** argv) {
                 tick_changed = false;
             }
 
+            if (!frames_requested && hud_visible) {
+                fill_hud(frame, stream.frames.size(), frames_per_tick, paused, ema_ms, hud_scale,
+                         hud_text, hud_accent_begin, hud_accent_end, hud_panel_verts, hud_quads,
+                         hud_quad_count);
+                std::memcpy(v.hud_line_buffer.mapped, hud_text.data(),
+                            hud_text.size() * sizeof(float));
+                std::memcpy(v.hud_panel_buffer.mapped, hud_panel_verts, sizeof hud_panel_verts);
+                std::memcpy(v.hud_quad_instance_buffer.mapped, hud_quads,
+                            hud_quad_count * sizeof(BodyInstance));
+            }
+
             uint32_t image_index = 0;
             result = vkAcquireNextImageKHR(v.device, v.swapchain, UINT64_MAX, v.image_available,
                                            VK_NULL_HANDLE, &image_index);
@@ -2554,6 +2954,16 @@ int main(int argc, char** argv) {
             vkCmdSetScissor(v.command_buffer, 0, 1, &scissor);
 
             const VkDeviceSize offsets[2] = {0, 0};
+            vkCmdBindVertexBuffers(v.command_buffer, 0, 1, &v.minor_line_buffer.buffer,
+                                   &offsets[0]);
+            vkCmdBindVertexBuffers(v.command_buffer, 1, 1, &v.minor_line_instance_buffer.buffer,
+                                   &offsets[1]);
+            vkCmdBindPipeline(v.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, v.line_pipeline);
+            const ViewPush minor_push = compute_view_push(state.camera, v.extent, 0.6f);
+            vkCmdPushConstants(v.command_buffer, v.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                               sizeof(ViewPush), &minor_push);
+            vkCmdDraw(v.command_buffer, 56, 1, 0, 0);
+
             vkCmdBindVertexBuffers(v.command_buffer, 0, 1, &v.line_buffer.buffer, &offsets[0]);
             vkCmdBindVertexBuffers(v.command_buffer, 1, 1, &v.line_instance_buffer.buffer,
                                    &offsets[1]);
@@ -2578,6 +2988,53 @@ int main(int argc, char** argv) {
                                    VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ViewPush),
                                    &flash_push);
                 vkCmdDraw(v.command_buffer, 4, static_cast<uint32_t>(flashes.size()), 0, 0);
+            }
+
+            if (!frames_requested && hud_visible && hud_quad_count > 0) {
+                // Panel: explicit pixel-space corners with the identity
+                // instance (index 2). Swatches: isotropic disc instances.
+                const ViewPush hud_quad_push = compute_screen_push(v.extent, 0.05f);
+                vkCmdBindVertexBuffers(v.command_buffer, 0, 1, &v.hud_panel_buffer.buffer,
+                                       &offsets[0]);
+                vkCmdBindVertexBuffers(v.command_buffer, 1, 1, &v.hud_line_instance_buffer.buffer,
+                                       &offsets[1]);
+                vkCmdBindPipeline(v.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  v.body_pipeline);
+                vkCmdPushConstants(v.command_buffer, v.pipeline_layout,
+                                   VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ViewPush),
+                                   &hud_quad_push);
+                vkCmdDraw(v.command_buffer, 4, 1, 0, 2);
+
+                vkCmdBindVertexBuffers(v.command_buffer, 0, 1, &v.quad_buffer.buffer,
+                                       &offsets[0]);
+                vkCmdBindVertexBuffers(v.command_buffer, 1, 1, &v.hud_quad_instance_buffer.buffer,
+                                       &offsets[1]);
+                vkCmdDraw(v.command_buffer, 4, hud_quad_count, 0, 0);
+
+                const ViewPush hud_text_push = compute_screen_push(v.extent, 0.03f);
+                vkCmdBindVertexBuffers(v.command_buffer, 0, 1, &v.hud_line_buffer.buffer,
+                                       &offsets[0]);
+                // The swatch draw above left the disc instances bound at
+                // binding 1; the text needs the color instances back or
+                // every glyph is culled by the disc falloff.
+                vkCmdBindVertexBuffers(v.command_buffer, 1, 1, &v.hud_line_instance_buffer.buffer,
+                                       &offsets[1]);
+                vkCmdBindPipeline(v.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  v.line_pipeline);
+                vkCmdPushConstants(v.command_buffer, v.pipeline_layout,
+                                   VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ViewPush),
+                                   &hud_text_push);
+                const uint32_t hud_verts = static_cast<uint32_t>(hud_text.size() / 2);
+                if (hud_accent_begin > 0) {
+                    vkCmdDraw(v.command_buffer, hud_accent_begin, 1, 0, 0);
+                }
+                if (hud_accent_end > hud_accent_begin) {
+                    vkCmdDraw(v.command_buffer, hud_accent_end - hud_accent_begin, 1,
+                              hud_accent_begin, 1);
+                }
+                if (hud_verts > hud_accent_end) {
+                    vkCmdDraw(v.command_buffer, hud_verts - hud_accent_end, 1, hud_accent_end, 0);
+                }
             }
 
             vkCmdEndRenderPass(v.command_buffer);

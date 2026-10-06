@@ -220,6 +220,12 @@ VGeoResource build_resource(const BuildManifest& manifest) {
     detail::build_lod_metadata(resource, mesh, manifest, cluster_global_indices,
                                source_to_runtime_cluster_indices);
 
+    // build_lod_metadata materializes lod_clusters in merged-record order
+    // while the payload bytes were appended in callback order; repack before
+    // paging so cluster-table order is the physical payload order
+    // (build_lod_pages slices pages out of cluster order).
+    detail::repack_lod_cluster_payloads(resource);
+
     std::vector<PageRecord> lod_pages =
         detail::build_lod_pages(resource.lod_clusters, manifest.page_cluster_limit,
                                 static_cast<uint32_t>(resource.pages.size()));

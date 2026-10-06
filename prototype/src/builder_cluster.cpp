@@ -305,14 +305,26 @@ std::vector<PageRecord> build_base_pages(const std::vector<ClusterRecord>& clust
          page_start += page_cluster_limit, ++page_index) {
         const uint32_t page_end = std::min(cluster_count, page_start + page_cluster_limit);
         const uint32_t first_offset = clusters[page_start].geometry_payload_offset;
-        const ClusterRecord& last_cluster = clusters[page_end - 1];
-        const uint32_t last_end =
-            last_cluster.geometry_payload_offset + last_cluster.geometry_payload_size;
+
+        // Same packing contract as the LOD path: clusters occupy the payload
+        // in cluster-table order (append_reordered_cluster guarantees it for
+        // the base payload); check rather than assume so a future reorder
+        // fails here instead of shipping invalid page ranges.
+        uint64_t expected_offset = first_offset;
+        for (uint32_t cluster_index = page_start; cluster_index < page_end; ++cluster_index) {
+            const ClusterRecord& cluster = clusters[cluster_index];
+            if (cluster.geometry_payload_offset != expected_offset) {
+                throw BuilderError(
+                    "base clusters are not packed contiguously in cluster-table order");
+            }
+            expected_offset += cluster.geometry_payload_size;
+        }
 
         PageRecord page;
         page.page_index = page_index;
         page.byte_offset = first_offset;
-        page.compressed_byte_size = last_end - first_offset;
+        page.compressed_byte_size =
+            narrow_payload_u32(expected_offset - first_offset, "geometry payload");
         page.uncompressed_byte_size = page.compressed_byte_size;
         page.first_cluster_index = page_start;
         page.cluster_count = page_end - page_start;
@@ -324,6 +336,44 @@ std::vector<PageRecord> build_base_pages(const std::vector<ClusterRecord>& clust
         pages.push_back(page);
     }
     return pages;
+}
+
+// Rebuild lod_geometry_payload in final lod_clusters order, rewriting every
+// cluster's geometry_payload_offset. clodBuild appends payload bytes in
+// callback-emission order while the union-find materialization in
+// build_lod_metadata emits lod_clusters records in merged-record order; once
+// a merge pulls non-adjacent callback groups together those orders diverge
+// and the cluster offsets go stale (LS-01 regression: page ranges derived
+// from [first cluster offset, last cluster end) wrapped or excluded member
+// payloads). Mirrors append_reordered_cluster's contract for the base
+// payload: cluster-table order is the canonical physical payload order, so
+// build_lod_pages can slice pages directly out of cluster order. Call after
+// the final lod_clusters order exists and before build_lod_pages.
+void repack_lod_cluster_payloads(VGeoResource& resource) {
+    if (resource.lod_clusters.empty()) {
+        resource.lod_geometry_payload.clear();
+        return;
+    }
+
+    // Records reference the callback-emission payload; keep those bytes while
+    // rebuilding the payload in cluster-table order.
+    std::vector<std::byte> source_payload = std::move(resource.lod_geometry_payload);
+    resource.lod_geometry_payload.clear();
+    resource.lod_geometry_payload.reserve(source_payload.size());
+
+    for (LodClusterRecord& cluster : resource.lod_clusters) {
+        const uint64_t source_begin = cluster.geometry_payload_offset;
+        const uint64_t source_end = source_begin + cluster.geometry_payload_size;
+        if (source_end > source_payload.size()) {
+            throw BuilderError("lod cluster payload range exceeds staged lod geometry payload");
+        }
+
+        cluster.geometry_payload_offset =
+            narrow_payload_u32(resource.lod_geometry_payload.size(), "LOD geometry payload");
+        const auto begin = source_payload.begin() + static_cast<std::ptrdiff_t>(source_begin);
+        const auto end = source_payload.begin() + static_cast<std::ptrdiff_t>(source_end);
+        resource.lod_geometry_payload.insert(resource.lod_geometry_payload.end(), begin, end);
+    }
 }
 
 std::vector<PageRecord> build_lod_pages(const std::vector<LodClusterRecord>& lod_clusters,
@@ -338,14 +388,28 @@ std::vector<PageRecord> build_lod_pages(const std::vector<LodClusterRecord>& lod
          page_start += page_cluster_limit, ++local_page_index) {
         const uint32_t page_end = std::min(cluster_count, page_start + page_cluster_limit);
         const uint32_t first_offset = lod_clusters[page_start].geometry_payload_offset;
-        const LodClusterRecord& last_cluster = lod_clusters[page_end - 1];
-        const uint32_t last_end =
-            last_cluster.geometry_payload_offset + last_cluster.geometry_payload_size;
+
+        // Contiguity is the packing contract repack_lod_cluster_payloads
+        // establishes: every cluster in the page slice must occupy exactly
+        // the next span of the payload. Check it here instead of deriving
+        // [first offset, last end) silently -- an order regression used to
+        // wrap uint32 arithmetic and fail only later in validate_resource
+        // (or ship invalid pages).
+        uint64_t expected_offset = first_offset;
+        for (uint32_t cluster_index = page_start; cluster_index < page_end; ++cluster_index) {
+            const LodClusterRecord& cluster = lod_clusters[cluster_index];
+            if (cluster.geometry_payload_offset != expected_offset) {
+                throw BuilderError(
+                    "lod clusters are not packed contiguously in cluster-table order");
+            }
+            expected_offset += cluster.geometry_payload_size;
+        }
 
         PageRecord page;
         page.page_index = page_index_base + local_page_index;
         page.byte_offset = first_offset;
-        page.compressed_byte_size = last_end - first_offset;
+        page.compressed_byte_size =
+            narrow_payload_u32(expected_offset - first_offset, "LOD geometry payload");
         page.uncompressed_byte_size = page.compressed_byte_size;
         page.first_cluster_index = 0;
         page.cluster_count = 0;
@@ -713,8 +777,11 @@ void build_lod_metadata(VGeoResource& resource, const MeshData& mesh, const Buil
         // only one of them (hole). Groups sharing a predecessor therefore
         // merge into one record (union-find over callback group ids), so a
         // record is always the complete replacement unit its provenance
-        // claims. Cluster payloads are staged per callback group and
-        // materialized into contiguous per-record spans after clodBuild.
+        // claims. Cluster records are staged per callback group and
+        // materialized in merged-record order after clodBuild; the payload
+        // bytes are appended in callback order during staging, so
+        // repack_lod_cluster_payloads() re-establishes cluster-table order
+        // as the physical payload order before page construction.
         struct StagedLodGroup {
             uint32_t depth = 0;
             Bounds3f bounds;

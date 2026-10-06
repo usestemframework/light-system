@@ -121,6 +121,15 @@ add_executable(meridian_builder
 
 target_link_libraries(meridian_builder PRIVATE vgeo_builder)
 
+# Unit tests for the builder's packing invariants (no fixtures, no GPU):
+# page/payload ordering contracts that end-to-end fixture smoke runs only
+# exercise accidentally (the LS-01 regression passed every committed scene).
+add_executable(meridian_builder_tests
+    src/builder_tests_main.cpp
+)
+
+target_link_libraries(meridian_builder_tests PRIVATE vgeo_builder)
+
 add_executable(meridian_dump
     src/dump_main.cpp
 )

@@ -127,7 +127,9 @@ void validate_resource(const VGeoResource& resource) {
         if (cluster.page_index >= resource.pages.size()) {
             throw BuilderError("cluster has invalid page index");
         }
-        if (cluster.geometry_payload_offset + cluster.geometry_payload_size >
+        // Widened: offset + size are both u32 in memory; a wrapped sum must
+        // not slip past the bounds check.
+        if (static_cast<uint64_t>(cluster.geometry_payload_offset) + cluster.geometry_payload_size >
             resource.cluster_geometry_payload.size()) {
             throw BuilderError("cluster payload range exceeds cluster geometry payload");
         }
@@ -156,17 +158,27 @@ void validate_resource(const VGeoResource& resource) {
                 throw BuilderError("lod page payload range exceeds lod geometry payload");
             }
             const uint32_t page_end = page.first_lod_cluster_index + page.lod_cluster_count;
+            // Structural packing contract (LS-01): a page is an exact slice
+            // of the table-ordered payload -- clusters sit back to back
+            // starting at the page offset and their spans sum to the page
+            // size. Containment alone let a reordered table (offsets still
+            // inside the page range) pass validation and ship pages whose
+            // byte ranges no reader could slice.
+            uint64_t expected_offset = page.byte_offset;
             for (uint32_t cluster_index = page.first_lod_cluster_index; cluster_index < page_end;
                  ++cluster_index) {
                 const LodClusterRecord& cluster = resource.lod_clusters[cluster_index];
                 if (cluster.page_index != page.page_index) {
                     throw BuilderError("lod page cluster does not point back to owning page");
                 }
-                if (cluster.geometry_payload_offset < page.byte_offset ||
-                    cluster.geometry_payload_offset + cluster.geometry_payload_size >
-                        page.byte_offset + page.uncompressed_byte_size) {
-                    throw BuilderError("lod cluster payload falls outside owning page payload range");
+                if (cluster.geometry_payload_offset != expected_offset) {
+                    throw BuilderError(
+                        "lod page clusters are not packed contiguously in table order");
                 }
+                expected_offset += cluster.geometry_payload_size;
+            }
+            if (expected_offset != page.byte_offset + page.uncompressed_byte_size) {
+                throw BuilderError("lod page payload size does not match its lod cluster spans");
             }
         } else {
             if (page.lod_cluster_count != 0) {
@@ -179,17 +191,22 @@ void validate_resource(const VGeoResource& resource) {
                 throw BuilderError("page payload range exceeds cluster geometry payload");
             }
             const uint32_t page_end = page.first_cluster_index + page.cluster_count;
+            // Same structural contract as the lod page branch above: exact
+            // slice of the table-ordered payload, no gaps, no reorder.
+            uint64_t expected_offset = page.byte_offset;
             for (uint32_t cluster_index = page.first_cluster_index; cluster_index < page_end;
                  ++cluster_index) {
                 const ClusterRecord& cluster = resource.clusters[cluster_index];
                 if (cluster.page_index != page.page_index) {
                     throw BuilderError("page cluster does not point back to owning page");
                 }
-                if (cluster.geometry_payload_offset < page.byte_offset ||
-                    cluster.geometry_payload_offset + cluster.geometry_payload_size >
-                        page.byte_offset + page.uncompressed_byte_size) {
-                    throw BuilderError("cluster payload falls outside owning page payload range");
+                if (cluster.geometry_payload_offset != expected_offset) {
+                    throw BuilderError("page clusters are not packed contiguously in table order");
                 }
+                expected_offset += cluster.geometry_payload_size;
+            }
+            if (expected_offset != page.byte_offset + page.uncompressed_byte_size) {
+                throw BuilderError("page payload size does not match its cluster spans");
             }
         }
 
@@ -298,7 +315,8 @@ void validate_resource(const VGeoResource& resource) {
         if (cluster.page_index >= resource.pages.size()) {
             throw BuilderError("lod cluster has invalid page index");
         }
-        if (cluster.geometry_payload_offset + cluster.geometry_payload_size >
+        // Widened: see the base-cluster range check above.
+        if (static_cast<uint64_t>(cluster.geometry_payload_offset) + cluster.geometry_payload_size >
             resource.lod_geometry_payload.size()) {
             throw BuilderError("lod cluster payload range exceeds lod geometry payload");
         }

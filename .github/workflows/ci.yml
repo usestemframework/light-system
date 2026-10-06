@@ -20,6 +20,8 @@ jobs:
         run: cmake -S prototype -B prototype/build -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build prototype/build -j
+      - name: Builder unit tests (packing invariants)
+        run: ./prototype/build/meridian_builder_tests
       - name: Builder smoke (committed scenes)
         run: |
           ./prototype/build/meridian_builder --manifest tools/sample_asset_manifest.txt

@@ -394,6 +394,11 @@ void flatten_temp_hierarchy(const std::vector<TempHierarchyNode>& temp_nodes,
                             uint32_t temp_node_index, uint32_t node_index, uint32_t parent_index);
 std::vector<PageRecord> build_base_pages(const std::vector<ClusterRecord>& clusters,
                                          uint32_t page_cluster_limit);
+// Rewrite lod_geometry_payload into final lod_clusters order (see the LS-01
+// regression: union-find materialization reorders records, not the
+// callback-ordered payload bytes). Must run between build_lod_metadata and
+// build_lod_pages.
+void repack_lod_cluster_payloads(VGeoResource& resource);
 std::vector<PageRecord> build_lod_pages(const std::vector<LodClusterRecord>& lod_clusters,
                                         uint32_t page_cluster_limit, uint32_t page_index_base);
 void update_hierarchy_page_ranges(VGeoResource& resource);

@@ -353,6 +353,7 @@ VkResult create_hzb_context(VkPhysicalDevice physical_device, VkDevice device,
         to_dst.image = context.image;
         to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, context.mip_count, 0, 1};
         VkImageMemoryBarrier to_read{};
+        to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;

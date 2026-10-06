@@ -48,6 +48,16 @@ struct VkBootstrapConfig {
     // is off; creation failure of the optional pipeline never aborts
     // bootstrap.
     bool enable_gpu_selection = false;
+    // Base-color texture mip chain: the embedded RGBA8 texture is uploaded
+    // with a full blit-generated mip chain (plus anisotropic filtering when
+    // the device supports it) instead of a single level. --no-texture-mips
+    // restores the single-level path bit-for-bit.
+    bool texture_mips = true;
+    // Opt-in tone mapping: exposure multiplier and the ACES + sRGB-encode
+    // output transform. Default (exposure 1.0, tonemap off) keeps the
+    // shaded output bit-identical to the historical renderer.
+    float exposure = 1.0f;
+    bool tonemap = false;
 };
 
 struct VkBootstrapReport {

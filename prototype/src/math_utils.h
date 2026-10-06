@@ -51,6 +51,11 @@ struct FrameUBO {
     // Index 0..kShadowCascadeCount-1 stores the three far splits; the last
     // slot is padding so the struct remains a multiple of 16 bytes (std140).
     float cascade_splits[4];
+    // Opt-in output transform (appended; existing field offsets unchanged):
+    // x = exposure multiplier, y = 1.0 when the ACES + sRGB-encode path is
+    // enabled, z/w unused. Default (1.0, 0.0) reproduces the historical
+    // bit-identical output.
+    float tonemap_params[4];
 };
 
 struct CascadeLightSetup {

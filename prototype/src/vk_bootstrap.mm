@@ -2346,7 +2346,40 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
     HzbContext hzb;
     OcclusionRefineContext occlusion_refine;
     ShadowContext shadow;
-    TraversalSelection last_submitted_selection;
+    // Frame-stable selection/draw cache: while the camera view-projection,
+    // camera position, and resident page mask are bitwise unchanged, the
+    // deterministic traversal and draw-list build reproduce the previous
+    // frame's outputs exactly, so the whole pipeline (main + shadow
+    // traversals, chunked draw build, bucket fold, and the host->device
+    // draw-list uploads) is skipped and the cached lists are reused
+    // as-is. Non-interactive cameras are static for the entire run;
+    // interactive cameras rest between inputs. Exact byte equality (not
+    // epsilon) is the key -- same rationale as the temporal HZB validity
+    // test in the frame loop: identical inputs through the same
+    // deterministic float ops produce identical bytes, and the resident
+    // page mask covers every scene mutation site (streaming completions,
+    // failures, evictions).
+    struct FrameStableCache {
+        bool valid = false;
+        Mat4f view_projection;
+        Vec3f camera_position;
+        std::vector<uint8_t> resident_pages;
+        bool separate_shadow = false;
+        TraversalSelection main_selection;
+        TraversalSelection shadow_selection;
+        std::vector<GpuDrawEntry> main_draws;
+        std::vector<GpuDrawEntry> shadow_draws;
+        std::vector<DrawBucket> main_buckets;
+        std::vector<DrawBucket> shadow_buckets;
+        uint32_t main_draw_count = 0;
+        uint32_t shadow_draw_count = 0;
+        uint32_t main_encode_count = 0;
+        uint32_t shadow_encode_count = 0;
+        uint64_t main_wasted_vs = 0;
+        uint64_t shadow_wasted_vs = 0;
+    };
+    FrameStableCache frame_cache;
+    uint32_t frame_cache_hits = 0;
     std::filesystem::path temp_vgeo_path;
     bool framebuffer_resized = false;
     bool texture_stats_reported = false;
@@ -2544,6 +2577,11 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
         device_features.multiDrawIndirect = supported_features.multiDrawIndirect;
         device_features.drawIndirectFirstInstance = supported_features.drawIndirectFirstInstance;
         device_features.independentBlend = supported_features.independentBlend;
+        // Enable-if-supported (independentBlend pattern): the base-color
+        // sampler requests anisotropic filtering only when the device
+        // exposes the feature; vkGetPhysicalDeviceFeatures on the same
+        // device gates the sampler side, so the two never disagree.
+        device_features.samplerAnisotropy = supported_features.samplerAnisotropy;
 
         VkPhysicalDeviceVulkan12Features vulkan12_features{};
         bool chain_vulkan12_features = false;
@@ -3034,7 +3072,7 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                                                      swapchain, scene_buffers,
                                                      report.uploadable_scene,
                                                      compute_selection.draw_list,
-                                                     debug_render);
+                                                     config.texture_mips, debug_render);
             if (r != VK_SUCCESS) {
                 return r;
             }
@@ -3092,10 +3130,11 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                     }
                 }
                 std::fprintf(stderr,
-                             "MERIDIAN_TEXTURE: %ux%u RGBA8 (%s), uv_clusters=%u+%u, "
+                             "MERIDIAN_TEXTURE: %ux%u RGBA8 (%s), mips=%u, uv_clusters=%u+%u, "
                              "payload_uv_range=[%.3f,%.3f]..[%.3f,%.3f]%s\n",
                              debug_render.base_texture_width, debug_render.base_texture_height,
                              debug_render.base_texture_is_placeholder ? "placeholder" : "embedded",
+                             debug_render.base_texture_mip_levels,
                              uv_base_clusters, uv_lod_clusters, uv_min[0], uv_min[1], uv_max[0],
                              uv_max[1], has_uv_range ? "" : " (none)");
             }
@@ -3399,33 +3438,52 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             TraversalSelection selection_for_frame_storage;
             TraversalSelection shadow_selection_storage;
             const bool separate_shadow_selection = config.shadow_error_scale > 1.0f;
-            if (separate_shadow_selection && traversal_executor != nullptr) {
-                const float shadow_threshold = error_threshold * config.shadow_error_scale;
-                std::vector<std::function<void()>> traverse_jobs;
-                traverse_jobs.push_back([&] {
+            const bool frame_cache_hit =
+                frame_cache.valid &&
+                frame_cache.separate_shadow == separate_shadow_selection &&
+                std::memcmp(frame_cache.view_projection.m, camera_frame.view_projection.m,
+                            sizeof(frame_cache.view_projection.m)) == 0 &&
+                std::memcmp(&frame_cache.camera_position, &camera_frame.camera_position,
+                            sizeof(frame_cache.camera_position)) == 0 &&
+                frame_cache.resident_pages == resident_pages;
+            if (frame_cache_hit) {
+                frame_cache_hits += 1;
+            } else {
+                if (separate_shadow_selection && traversal_executor != nullptr) {
+                    const float shadow_threshold = error_threshold * config.shadow_error_scale;
+                    std::vector<std::function<void()>> traverse_jobs;
+                    traverse_jobs.push_back([&] {
+                        selection_for_frame_storage =
+                            simulate_traversal(resource, error_threshold, resident_pages,
+                                               traversal_executor);
+                    });
+                    traverse_jobs.push_back([&] {
+                        shadow_selection_storage =
+                            simulate_traversal(resource, shadow_threshold, resident_pages,
+                                               traversal_executor);
+                    });
+                    worker_pool.run(traverse_jobs);
+                } else {
                     selection_for_frame_storage =
                         simulate_traversal(resource, error_threshold, resident_pages,
                                            traversal_executor);
-                });
-                traverse_jobs.push_back([&] {
-                    shadow_selection_storage =
-                        simulate_traversal(resource, shadow_threshold, resident_pages,
-                                           traversal_executor);
-                });
-                worker_pool.run(traverse_jobs);
-            } else {
-                selection_for_frame_storage =
-                    simulate_traversal(resource, error_threshold, resident_pages,
-                                       traversal_executor);
-                if (separate_shadow_selection) {
-                    shadow_selection_storage =
-                        simulate_traversal(resource, error_threshold * config.shadow_error_scale,
-                                           resident_pages, traversal_executor);
+                    if (separate_shadow_selection) {
+                        shadow_selection_storage =
+                            simulate_traversal(resource, error_threshold * config.shadow_error_scale,
+                                               resident_pages, traversal_executor);
+                    }
                 }
+                frame_cache.valid = true;
+                frame_cache.view_projection = camera_frame.view_projection;
+                frame_cache.camera_position = camera_frame.camera_position;
+                frame_cache.resident_pages = resident_pages;
+                frame_cache.separate_shadow = separate_shadow_selection;
+                frame_cache.main_selection = std::move(selection_for_frame_storage);
+                frame_cache.shadow_selection = std::move(shadow_selection_storage);
             }
-            const TraversalSelection& selection_for_frame = selection_for_frame_storage;
+            const TraversalSelection& selection_for_frame = frame_cache.main_selection;
             const TraversalSelection* shadow_selection =
-                separate_shadow_selection ? &shadow_selection_storage : &selection_for_frame;
+                separate_shadow_selection ? &frame_cache.shadow_selection : &selection_for_frame;
             auto t_traverse_end = clock_t::now();
             static double acc_traverse_ms = 0.0;
             static double acc_build_ms = 0.0;
@@ -3434,8 +3492,11 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             static double acc_cmdrec_ms = 0.0;
             static double acc_submit_ms = 0.0;
             static uint32_t cpu_prof_samples = 0;
-            acc_traverse_ms +=
-                std::chrono::duration<double, std::milli>(t_traverse_end - t_traverse_start).count();
+            if (!frame_cache_hit) {
+                acc_traverse_ms +=
+                    std::chrono::duration<double, std::milli>(t_traverse_end - t_traverse_start)
+                        .count();
+            }
 
             // Residency keeps pages for BOTH selections alive: append the
             // shadow selection's page lists to the main selection's (page
@@ -3571,7 +3632,13 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                 return report;
             }
 
-            update_debug_selection_report(selection_for_frame, report.uploadable_scene, report);
+            // The selection report walks every selected cluster (serial);
+            // its values only feed the final report, and a cache hit means
+            // the selection is byte-identical to the last computed one, so
+            // the stored counts are already current.
+            if (!frame_cache_hit) {
+                update_debug_selection_report(selection_for_frame, report.uploadable_scene, report);
+            }
             report.runtime_missing_page_count =
                 static_cast<uint32_t>(residency_selection->missing_page_indices.size());
             report.runtime_prefetch_page_count =
@@ -3583,10 +3650,13 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             report.runtime_resident_page_count = count_resident_pages(residency_model);
             report.runtime_failed_page_count = stream_page_failures;
 
-            report.replay_runtime_parity =
-                report.debug_selected_node_count == report.replay_selected_node_count &&
-                report.debug_rendered_cluster_count == report.replay_selected_cluster_count &&
-                report.debug_rendered_lod_cluster_count == report.replay_selected_lod_cluster_count;
+            if (!frame_cache_hit) {
+                report.replay_runtime_parity =
+                    report.debug_selected_node_count == report.replay_selected_node_count &&
+                    report.debug_rendered_cluster_count == report.replay_selected_cluster_count &&
+                    report.debug_rendered_lod_cluster_count ==
+                        report.replay_selected_lod_cluster_count;
+            }
 
             auto t_fence_start = clock_t::now();
             vkWaitForFences(device, 1, &frame.in_flight, VK_TRUE, UINT64_MAX);
@@ -3625,7 +3695,13 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                     }
                 }
             }
-            vkResetFences(device, 1, &frame.in_flight);
+            // The in-flight fence is reset only after a successful acquire,
+            // immediately before the owning vkQueueSubmit (the LS-64
+            // pattern, mirroring ontos_view): an OUT_OF_DATE/SUBOPTIMAL
+            // acquire continues to the next frame without submitting
+            // anything that would signal a reset fence, and the fence is
+            // created signaled so every no-submit path leaves it signaled
+            // for the next vkWaitForFences.
             vkResetCommandPool(device, frame.command_pool, 0);
 
             uint32_t image_index = 0;
@@ -3700,6 +3776,10 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             frame_ubo_data.light_dir[1] = norm_light.y;
             frame_ubo_data.light_dir[2] = norm_light.z;
             frame_ubo_data.light_dir[3] = 0.0f;
+            frame_ubo_data.tonemap_params[0] = config.exposure;
+            frame_ubo_data.tonemap_params[1] = config.tonemap ? 1.0f : 0.0f;
+            frame_ubo_data.tonemap_params[2] = 0.0f;
+            frame_ubo_data.tonemap_params[3] = 0.0f;
             update_uploaded_buffer(device, &frame_ubo_data, sizeof(FrameUBO),
                                    debug_render.frame_ubo);
 
@@ -3765,6 +3845,18 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             uint32_t shadow_encode_count = 0;
             uint64_t main_wasted_vs = 0;
             uint64_t shadow_wasted_vs = 0;
+            if (frame_cache_hit) {
+                // Cached frame: the draw lists, bucket folds, and counts are
+                // byte-identical to what is already in the HOST_COHERENT
+                // draw-list buffers (they are host-written only), so the
+                // build and the re-upload of identical bytes are skipped.
+                cpu_draw_count = frame_cache.main_draw_count;
+                shadow_draw_count = frame_cache.shadow_draw_count;
+                main_encode_count = frame_cache.main_encode_count;
+                shadow_encode_count = frame_cache.shadow_encode_count;
+                main_wasted_vs = frame_cache.main_wasted_vs;
+                shadow_wasted_vs = frame_cache.shadow_wasted_vs;
+            } else {
             std::vector<DrawBucket> main_buckets;
             std::vector<DrawBucket> shadow_buckets;
             {
@@ -4024,7 +4116,20 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                 auto t_upload_end = clock_t::now();
                 acc_upload_ms +=
                     std::chrono::duration<double, std::milli>(t_upload_end - t_upload_start).count();
+                frame_cache.main_draws = std::move(cpu_draws);
+                frame_cache.shadow_draws = std::move(shadow_draws);
+                frame_cache.main_buckets = std::move(main_buckets);
+                frame_cache.shadow_buckets = std::move(shadow_buckets);
+                frame_cache.main_draw_count = cpu_draw_count;
+                frame_cache.shadow_draw_count = shadow_draw_count;
+                frame_cache.main_encode_count = main_encode_count;
+                frame_cache.shadow_encode_count = shadow_encode_count;
+                frame_cache.main_wasted_vs = main_wasted_vs;
+                frame_cache.shadow_wasted_vs = shadow_wasted_vs;
             }
+            }
+            const std::vector<DrawBucket>& main_buckets = frame_cache.main_buckets;
+            const std::vector<DrawBucket>& shadow_buckets = frame_cache.shadow_buckets;
 
             // frustum was already extracted above for cluster-level CPU culling
             auto t_cmdrec_start = clock_t::now();
@@ -4075,6 +4180,7 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             submit_info.pSignalSemaphores = &signal_semaphore;
 
             auto t_submit_start = clock_t::now();
+            vkResetFences(device, 1, &frame.in_flight);
             result = vkQueueSubmit(graphics_queue, 1, &submit_info, frame.in_flight);
             auto t_submit_end = clock_t::now();
             acc_submit_ms +=
@@ -4082,7 +4188,7 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             cpu_prof_samples++;
             if (cpu_prof_samples % 60 == 0) {
                 std::fprintf(stderr,
-                    "MERIDIAN_CPU: threads=%u traverse=%.2f residency=%.2f build=%.2f upload=%.2f cmdrec=%.2f submit=%.2f fence=%.2f present=%.2f draws=main:%u shadow:%u encodes main:%u shadow:%u wastedvs main:%llu shadow:%llu (ms/frame, n=%u)\n",
+                    "MERIDIAN_CPU: threads=%u traverse=%.2f residency=%.2f build=%.2f upload=%.2f cmdrec=%.2f submit=%.2f fence=%.2f present=%.2f draws=main:%u shadow:%u encodes main:%u shadow:%u wastedvs main:%llu shadow:%llu cache=%u/%u (ms/frame, n=%u)\n",
                     resolved_worker_threads,
                     acc_traverse_ms / cpu_prof_samples,
                     acc_residency_ms / cpu_prof_samples,
@@ -4098,6 +4204,8 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                     shadow_encode_count,
                     static_cast<unsigned long long>(main_wasted_vs),
                     static_cast<unsigned long long>(shadow_wasted_vs),
+                    frame_cache_hits,
+                    cpu_prof_samples,
                     cpu_prof_samples);
             }
             if (result != VK_SUCCESS) {
@@ -4141,7 +4249,11 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
                 return report;
             }
 
-            last_submitted_selection = selection_for_frame;
+            // last_submitted_selection: the frame-stable cache holds the
+            // latest presented frame's selection verbatim (cache hits reuse
+            // it byte-identically), so the per-frame selection copy is gone;
+            // the post-loop epilogue reads frame_cache.main_selection.
+
             report.presented_frame_count += 1;
             report.debug_draw_submitted = true;
         }
@@ -4187,8 +4299,8 @@ VkBootstrapReport build_vk_bootstrap_report(VGeoResource& resource,
             std::filesystem::remove(temp_vgeo_path, ec);
         }
         if (report.presented_frame_count > 0) {
-            analyze_visibility_readback(device, swapchain, debug_render, last_submitted_selection,
-                                       report);
+            analyze_visibility_readback(device, swapchain, debug_render,
+                                        frame_cache.main_selection, report);
         }
         report.present_loop_completed = report.presented_frame_count == config.present_frame_count;
 

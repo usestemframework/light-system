@@ -2,6 +2,8 @@
 #include "visibility_format.h"
 
 #include <charconv>
+#include <cmath>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -29,8 +31,21 @@ bool parse_thread_count(std::string_view value, uint32_t& out) {
     return true;
 }
 
+// Strict positive-float parse for --exposure: strtof full-string +
+// finite-and-positive check (nan/inf/0/negative rejected), mirroring the
+// --threads hardening (LS-52) and manifest float rules (LS-57).
+bool parse_positive_float(std::string_view value, float& out) {
+    char* end = nullptr;
+    const float parsed = std::strtof(value.data(), &end);
+    if (end != value.data() + value.size() || !std::isfinite(parsed) || parsed <= 0.0f) {
+        return false;
+    }
+    out = parsed;
+    return true;
+}
+
 void print_usage() {
-    std::cerr << "Usage: meridian_vk_bootstrap --manifest <path> [--interactive] [--screenshot <path>] [--budget <pages>] [--demand-streaming] [--error-threshold <value>] [--shadow-error-scale <value>] [--threads <count>] [--validate]\n"
+    std::cerr << "Usage: meridian_vk_bootstrap --manifest <path> [--interactive] [--screenshot <path>] [--budget <pages>] [--demand-streaming] [--error-threshold <value>] [--shadow-error-scale <value>] [--threads <count>] [--validate] [--no-texture-mips] [--tonemap] [--exposure <value>]\n"
                  "  --screenshot writes a raw PPM image (extension forced to .ppm)\n"
                  "  --error-threshold sets the LOD selection threshold (default: auto =\n"
                  "  max(0.001, 8.9x the scene's median LOD-group geometric error), so\n"
@@ -40,10 +55,16 @@ void print_usage() {
                  "  --threads sets the total worker threads for traversal and draw-list\n"
                  "  build (default: auto = min(hardware_concurrency, 8); 1 = serial;\n"
                  "  output is bit-identical at any count)\n"
-                  "  --no-gpu-timers disables the per-frame GPU timestamp queries and the\n"
-                  "  MERIDIAN_GPU lines (measures the unprofiled submit path)\n"
-                  "  --gpu-selection also builds the (currently undispatched) cluster_select\n"
-                  "  compute pipeline; creation failure is non-fatal\n";
+                   "  --no-gpu-timers disables the per-frame GPU timestamp queries and the\n"
+                   "  MERIDIAN_GPU lines (measures the unprofiled submit path)\n"
+                   "  --gpu-selection also builds the (currently undispatched) cluster_select\n"
+                   "  compute pipeline; creation failure is non-fatal\n"
+                   "  --no-texture-mips disables the base-color texture mip chain and\n"
+                   "  anisotropic filtering (single-level sampling, the historical path)\n"
+                   "  --tonemap enables the ACES filmic curve + sRGB encode on the final\n"
+                   "  color (default off keeps output bit-identical to the old renderer)\n"
+                   "  --exposure sets the exposure multiplier applied before tone mapping\n"
+                   "  (default 1.0; only observable with --tonemap)\n";
 }
 
 }  // namespace
@@ -60,6 +81,9 @@ int main(int argc, char** argv) {
     bool demand_streaming = false;
     bool enable_gpu_timers = true;
     bool gpu_selection = false;
+    bool texture_mips = true;
+    float exposure = 1.0f;
+    bool tonemap = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--manifest" && i + 1 < argc) {
@@ -89,6 +113,17 @@ int main(int argc, char** argv) {
             enable_gpu_timers = false;
         } else if (arg == "--gpu-selection") {
             gpu_selection = true;
+        } else if (arg == "--no-texture-mips") {
+            texture_mips = false;
+        } else if (arg == "--tonemap") {
+            tonemap = true;
+        } else if (arg == "--exposure" && i + 1 < argc) {
+            if (!parse_positive_float(argv[i + 1], exposure)) {
+                std::cerr << "invalid --exposure value: " << argv[i + 1]
+                          << " (expected a finite positive number)\n";
+                return 1;
+            }
+            ++i;
         } else {
             print_usage();
             return 1;
@@ -121,6 +156,9 @@ int main(int argc, char** argv) {
         config.worker_threads = worker_threads;
         config.enable_gpu_timers = enable_gpu_timers;
         config.enable_gpu_selection = gpu_selection;
+        config.texture_mips = texture_mips;
+        config.exposure = exposure;
+        config.tonemap = tonemap;
         config.persisted_vgeo_path = manifest.output_path.string();
         const meridian::VkBootstrapReport report =
             meridian::build_vk_bootstrap_report(resource, config);

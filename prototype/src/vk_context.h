@@ -134,6 +134,9 @@ struct DebugRenderContext {
     VkSampler base_texture_sampler = VK_NULL_HANDLE;
     uint32_t base_texture_width = 0;
     uint32_t base_texture_height = 0;
+    // Mip levels of the created base-color texture (1 = single-level
+    // sampling, the historical path; > 1 = blit-generated chain).
+    uint32_t base_texture_mip_levels = 1;
     bool base_texture_is_placeholder = false;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
@@ -315,6 +318,7 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
                                       const UploadedSceneBuffers& scene_buffers,
                                       const struct UploadableScene& scene,
                                       const UploadedBuffer& draw_list,
+                                      bool generate_texture_mips,
                                       DebugRenderContext& context);
 
 #endif  // MERIDIAN_VK_CONTEXT_HAS_VULKAN && MERIDIAN_VK_CONTEXT_HAS_GLFW

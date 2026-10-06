@@ -72,7 +72,7 @@ Performance (Apple M4, MoltenVK, 1280x720, meshoptimizer pinned at c645e49):
 - Stanford Dragon (871K tris): median 15.4ms / ~65 FPS.
 - Massive City (1M tris): median 30.6ms / ~33 FPS at full-detail threshold (LOD hierarchy for this scene is threshold-degenerate; see docs/IMPLEMENTATION_STATUS.md).
 
-Interactive mode: `--interactive` for continuous present loop, WASD + mouse look + Q/E vertical, FPS in window title. `--error-threshold` tunes LOD selection per scene (default 0.001).
+Interactive mode: `--interactive` for continuous present loop, WASD + mouse look + Q/E vertical, FPS in window title. `--error-threshold` tunes LOD selection per scene (default 0.001). `--no-texture-mips` restores single-level texture sampling (mip chain + anisotropic filtering is the default). `--tonemap` opts into ACES filmic + sRGB output encoding with `--exposure <value>` (default off keeps output bit-identical to the historical renderer).
 
 See [`docs/IMPLEMENTATION_STATUS.md`](./docs/IMPLEMENTATION_STATUS.md) for the full pipeline state, known issues, and per-pass timings.
 

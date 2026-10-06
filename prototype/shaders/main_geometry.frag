@@ -5,6 +5,7 @@ layout(set = 0, binding = 2) uniform FrameData {
     mat4 light_vp[3];
     vec4 light_dir;
     vec4 cascade_splits;
+    vec4 tonemap_params;
 } frame;
 
 // Plain 2D array sampler: we do the depth comparison manually because
@@ -102,7 +103,20 @@ void main() {
     vec3 ground_color = vec3(0.35, 0.3, 0.28);
     vec3 ambient = base_color * mix(ground_color, sky_color, up) * 0.75;
     vec3 diffuse = base_color * ndotl * shadow * 0.8;
-    out_color = vec4(ambient + diffuse, 1.0);
+    vec3 color = ambient + diffuse;
+
+    // Opt-in output transform (uniform branch; default y=0 keeps the
+    // passthrough bit-identical). The swapchain is UNORM with an SRGB
+    // NONLINEAR color space, so the passthrough path writes linear values
+    // that clip at the display; this path applies exposure, the Narkowicz
+    // ACES filmic fit, and an sRGB encode before the UNORM store.
+    if (frame.tonemap_params.y > 0.5) {
+        vec3 mapped = color * frame.tonemap_params.x;
+        mapped = clamp((mapped * (2.51 * mapped + 0.03)) /
+                       (mapped * (2.43 * mapped + 0.59) + 0.14), 0.0, 1.0);
+        color = pow(mapped, vec3(1.0 / 2.2));
+    }
+    out_color = vec4(color, 1.0);
 
     // Two-word visibility encoding matching visibility_format.h:
     // word0 = instance_index (always 0 for single-instance scenes)

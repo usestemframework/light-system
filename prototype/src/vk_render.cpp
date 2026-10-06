@@ -6,6 +6,7 @@
 #include "resource_upload.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -151,16 +152,28 @@ VkResult create_visibility_resources(VkPhysicalDevice physical_device, VkDevice 
 
 // Creates the base-color texture (binding 5) from the scene's embedded
 // RGBA8 payload, or a 1x1 white placeholder when the scene is untextured.
-// Upload path mirrors create_device_local_buffer_staged: HOST_VISIBLE
-// staging buffer + one-shot vkCmdCopyBufferToImage with queue idle wait.
+// With generate_texture_mips the image carries a full blit-generated mip
+// chain (GENERAL-layout upload: vkCmdBlitImage cannot read the
+// TRANSFER_DST_OPTIMAL layout, so the mip path stages through GENERAL and
+// transitions once at the end) and the sampler switches to trilinear +
+// anisotropic filtering when the device enables samplerAnisotropy. The
+// single-level path is byte-for-byte the historical one.
 VkResult create_base_texture_resources(VkPhysicalDevice physical_device, VkDevice device,
                                         VkQueue upload_queue, uint32_t upload_queue_family,
-                                        const UploadableScene& scene, DebugRenderContext& context) {
+                                        const UploadableScene& scene, bool generate_texture_mips,
+                                        DebugRenderContext& context) {
     const bool has_scene_texture =
         !scene.texture_payload.empty() && scene.texture_width > 0 && scene.texture_height > 0;
     context.base_texture_is_placeholder = !has_scene_texture;
     context.base_texture_width = has_scene_texture ? scene.texture_width : 1;
     context.base_texture_height = has_scene_texture ? scene.texture_height : 1;
+    context.base_texture_mip_levels =
+        generate_texture_mips
+            ? static_cast<uint32_t>(std::floor(std::log2(
+                  static_cast<float>(std::max(context.base_texture_width,
+                                              context.base_texture_height))))) + 1u
+            : 1u;
+    const uint32_t mip_levels = context.base_texture_mip_levels;
 
     const uint8_t white_pixel[4] = {0xff, 0xff, 0xff, 0xff};
     const void* pixels = nullptr;
@@ -185,12 +198,16 @@ VkResult create_base_texture_resources(VkPhysicalDevice physical_device, VkDevic
     image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     image_info.imageType = VK_IMAGE_TYPE_2D;
     image_info.extent = {context.base_texture_width, context.base_texture_height, 1};
-    image_info.mipLevels = 1;
+    image_info.mipLevels = mip_levels;
     image_info.arrayLayers = 1;
     image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
     image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (mip_levels > 1) {
+        // Blit source for the mip chain (level i-1 feeds level i).
+        image_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    }
     image_info.samples = VK_SAMPLE_COUNT_1_BIT;
     image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     result = vkCreateImage(device, &image_info, nullptr, &context.base_texture_image);
@@ -263,39 +280,113 @@ VkResult create_base_texture_resources(VkPhysicalDevice physical_device, VkDevic
         return result;
     }
 
-    VkImageMemoryBarrier to_transfer_dst{};
-    to_transfer_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    to_transfer_dst.srcAccessMask = 0;
-    to_transfer_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    to_transfer_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    to_transfer_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_transfer_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_transfer_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_transfer_dst.image = context.base_texture_image;
-    to_transfer_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                          &to_transfer_dst);
-
     VkBufferImageCopy copy_region{};
     copy_region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy_region.imageExtent = {context.base_texture_width, context.base_texture_height, 1};
-    vkCmdCopyBufferToImage(command_buffer, staging.buffer, context.base_texture_image,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
 
-    VkImageMemoryBarrier to_shader_read{};
-    to_shader_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    to_shader_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    to_shader_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    to_shader_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_shader_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    to_shader_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_shader_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_shader_read.image = context.base_texture_image;
-    to_shader_read.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                          &to_shader_read);
+    if (mip_levels > 1) {
+        // Mip path: the whole image lives in GENERAL for upload + chain
+        // generation (vkCmdBlitImage requires TRANSFER_SRC_OPTIMAL or
+        // GENERAL for its source; transitioning per-mip between blits is
+        // avoidable by staying in GENERAL until the single final
+        // transition). Each blit reads level i-1 after a write->read
+        // barrier on that level; blits target TRANSFER_DST_OPTIMAL-free
+        // layouts only, so both layouts here are GENERAL.
+        VkImageMemoryBarrier to_general{};
+        to_general.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        to_general.srcAccessMask = 0;
+        to_general.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        to_general.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_general.image = context.base_texture_image;
+        to_general.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, 1};
+        vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                              &to_general);
+
+        vkCmdCopyBufferToImage(command_buffer, staging.buffer, context.base_texture_image,
+                               VK_IMAGE_LAYOUT_GENERAL, 1, &copy_region);
+
+        for (uint32_t mip = 1; mip < mip_levels; ++mip) {
+            VkImageMemoryBarrier level_ready{};
+            level_ready.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            level_ready.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            level_ready.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            level_ready.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            level_ready.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            level_ready.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            level_ready.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            level_ready.image = context.base_texture_image;
+            level_ready.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip - 1, 1, 0, 1};
+            vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                  &level_ready);
+
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip - 1, 0, 1};
+            blit.srcOffsets[0] = {0, 0, 0};
+            blit.srcOffsets[1] = {
+                static_cast<int32_t>(std::max(1u, context.base_texture_width >> (mip - 1u))),
+                static_cast<int32_t>(std::max(1u, context.base_texture_height >> (mip - 1u))),
+                1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
+            blit.dstOffsets[0] = {0, 0, 0};
+            blit.dstOffsets[1] = {
+                static_cast<int32_t>(std::max(1u, context.base_texture_width >> mip)),
+                static_cast<int32_t>(std::max(1u, context.base_texture_height >> mip)),
+                1};
+            vkCmdBlitImage(command_buffer, context.base_texture_image, VK_IMAGE_LAYOUT_GENERAL,
+                           context.base_texture_image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
+                           VK_FILTER_LINEAR);
+        }
+
+        VkImageMemoryBarrier to_shader_read{};
+        to_shader_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        to_shader_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        to_shader_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        to_shader_read.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        to_shader_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        to_shader_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_shader_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_shader_read.image = context.base_texture_image;
+        to_shader_read.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, 1};
+        vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                              &to_shader_read);
+    } else {
+        VkImageMemoryBarrier to_transfer_dst{};
+        to_transfer_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        to_transfer_dst.srcAccessMask = 0;
+        to_transfer_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        to_transfer_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        to_transfer_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        to_transfer_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_transfer_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_transfer_dst.image = context.base_texture_image;
+        to_transfer_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                              &to_transfer_dst);
+
+        vkCmdCopyBufferToImage(command_buffer, staging.buffer, context.base_texture_image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
+
+        VkImageMemoryBarrier to_shader_read{};
+        to_shader_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        to_shader_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        to_shader_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        to_shader_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        to_shader_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        to_shader_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_shader_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_shader_read.image = context.base_texture_image;
+        to_shader_read.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                              &to_shader_read);
+    }
 
     result = vkEndCommandBuffer(command_buffer);
     if (result != VK_SUCCESS) {
@@ -323,24 +414,37 @@ VkResult create_base_texture_resources(VkPhysicalDevice physical_device, VkDevic
     view_info.image = context.base_texture_image;
     view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
     view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
-    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, 1};
     result = vkCreateImageView(device, &view_info, nullptr, &context.base_texture_view);
     if (result != VK_SUCCESS) {
         return result;
     }
 
+    // Anisotropic filtering only pairs with a mip chain (maxLod 0 never
+    // leaves level 0) and only when the device feature was enabled at
+    // device creation (see the samplerAnisotropy enable-if-supported line
+    // in build_vk_bootstrap_report).
+    VkPhysicalDeviceFeatures supported_features{};
+    vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(physical_device, &properties);
+    const bool anisotropic = mip_levels > 1 && supported_features.samplerAnisotropy == VK_TRUE;
+
     VkSamplerCreateInfo sampler_info{};
     sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     sampler_info.magFilter = VK_FILTER_LINEAR;
     sampler_info.minFilter = VK_FILTER_LINEAR;
+    sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
     sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler_info.anisotropyEnable = VK_FALSE;
-    sampler_info.maxAnisotropy = 1.0f;
+    sampler_info.anisotropyEnable = anisotropic ? VK_TRUE : VK_FALSE;
+    sampler_info.maxAnisotropy = anisotropic
+                                     ? std::min(8.0f, properties.limits.maxSamplerAnisotropy)
+                                     : 1.0f;
     sampler_info.compareEnable = VK_FALSE;
     sampler_info.minLod = 0.0f;
-    sampler_info.maxLod = 0.0f;
+    sampler_info.maxLod = mip_levels > 1 ? static_cast<float>(mip_levels) : 0.0f;
     return vkCreateSampler(device, &sampler_info, nullptr, &context.base_texture_sampler);
 }
 
@@ -350,6 +454,7 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
                                       const UploadedSceneBuffers& scene_buffers,
                                       const UploadableScene& scene,
                                       const UploadedBuffer& draw_list,
+                                      bool generate_texture_mips,
                                       DebugRenderContext& context) {
 #if !MERIDIAN_HAS_SHADERC
     (void)physical_device;
@@ -360,11 +465,13 @@ VkResult create_debug_render_context(VkPhysicalDevice physical_device, VkDevice 
     (void)scene_buffers;
     (void)scene;
     (void)draw_list;
+    (void)generate_texture_mips;
     (void)context;
     return VK_ERROR_FEATURE_NOT_PRESENT;
 #else
     VkResult result = create_base_texture_resources(physical_device, device, upload_queue,
-                                                     upload_queue_family, scene, context);
+                                                     upload_queue_family, scene,
+                                                     generate_texture_mips, context);
     if (result != VK_SUCCESS) {
         return result;
     }

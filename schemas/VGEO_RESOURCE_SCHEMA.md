@@ -1,6 +1,6 @@
 # VGeo Resource Schema
 
-Last updated: 2026-09-12
+Last updated: 2026-10-07
 
 This is the first-pass logical schema for a dense-geometry resource.
 
@@ -13,6 +13,21 @@ It is intentionally implementation-agnostic and should be refined before binary 
 - support page streaming
 - preserve a fallback path for unsupported runtimes
 - leave room for future compressed and alternate geometry representations
+
+## Generated geometry portability
+
+Generated normals, normal cones, and optimized geometry are not promised to
+rebuild byte-identically across compilers or floating-point environments.
+Host math and optimization routines can differ. Cross-toolchain regeneration
+checks must compare decoded geometry with a tolerance stated by the check;
+there is no global tolerance that permits a mismatched cached resource.
+
+The content fingerprint always identifies the actual generated payload and
+metadata bytes. A `.vgeo` file and its sidecar must match exactly regardless of
+where they were produced or consumed. When rebuilding on another toolchain,
+publish the newly generated resource and sidecar together; never accept an old
+sidecar using a numerical tolerance. Generated geometry remains stored without
+additional normal quantization, and schema version 6 is unchanged.
 
 ## Logical Sections
 
